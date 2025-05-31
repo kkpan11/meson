@@ -1223,6 +1223,7 @@ class NinjaBackend(backends.Backend):
                                                 capture=ofilenames[0] if target.capture else None,
                                                 feed=srcs[0] if target.feed else None,
                                                 env=target.env,
+                                                can_use_rsp_file=target.rspable,
                                                 verbose=target.console)
         if reason:
             cmd_type = f' (wrapped by meson {reason})'
@@ -1775,7 +1776,7 @@ class NinjaBackend(backends.Backend):
                 gres_xml, = self.get_custom_target_sources(gensrc)
                 args += ['--gresources=' + gres_xml]
                 for source_dir in gensrc.source_dirs:
-                    gres_dirs += [os.path.join(self.get_target_dir(gensrc), source_dir)]
+                    gres_dirs += [source_dir]
                 # Ensure that resources are built before vala sources
                 # This is required since vala code using [GtkTemplate] effectively depends on .ui files
                 # GResourceHeaderTarget is not suitable due to lacking depfile
