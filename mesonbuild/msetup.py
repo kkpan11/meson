@@ -11,7 +11,7 @@ import typing as T
 
 from . import build, coredata, environment, interpreter, mesonlib, mintro, mlog
 from .mesonlib import MesonException
-from .options import COMPILER_BASE_OPTIONS, OptionKey
+from .options import OptionKey
 
 if T.TYPE_CHECKING:
     from typing_extensions import Protocol
@@ -188,25 +188,22 @@ class MesonApp:
             mlog.set_timestamp_start(time.monotonic())
         if self.options.clearcache:
             env.coredata.clear_cache()
-        with mesonlib.BuildDirLock(self.build_dir):
+        with mesonlib.DirectoryLock(self.build_dir, 'meson-private/meson.lock',
+                                    mesonlib.DirectoryLockAction.FAIL,
+                                    'Some other Meson process is already using this build directory. Exiting.'):
             return self._generate(env, capture, vslite_ctx)
 
-    def check_unused_options(self, coredata: 'coredata.CoreData', cmd_line_options: T.Any, all_subprojects: T.Any) -> None:
+    def check_unused_options(self, coredata: 'coredata.CoreData', cmd_line_options: T.Dict[OptionKey, str], all_subprojects: T.Mapping[str, object]) -> None:
         pending = coredata.optstore.pending_options
         errlist: T.List[str] = []
+        known_subprojects = all_subprojects.keys()
         for opt in pending:
-            # It is not an error to set wrong option for unknown subprojects or
-            # language because we don't have control on which one will be selected.
-            if opt.subproject and opt.subproject not in all_subprojects:
+            # It is not an error to set wrong option for unknown subprojects
+            # because they might be used in future reconfigurations
+            if coredata.optstore.accept_as_pending_option(opt, known_subprojects):
                 continue
-            if coredata.optstore.is_compiler_option(opt):
-                continue
-            if (coredata.optstore.is_base_option(opt) and
-                    opt.evolve(subproject=None, machine=mesonlib.MachineChoice.HOST) in COMPILER_BASE_OPTIONS):
-                continue
-            keystr = str(opt)
-            if keystr in cmd_line_options:
-                errlist.append(f'"{keystr}"')
+            if opt in cmd_line_options:
+                errlist.append(f'"{opt}"')
         if errlist:
             errstr = ', '.join(errlist)
             raise MesonException(f'Unknown options: {errstr}')
@@ -350,17 +347,18 @@ def run_genvslite_setup(options: CMDOptions) -> None:
     # invoke the appropriate 'meson compile ...' build commands upon the normal visual studio build/rebuild/clean actions, instead of using
     # the native VS/msbuild system.
     builddir_prefix = options.builddir
-    genvsliteval = options.cmd_line_options.pop('genvslite') # type: ignore [call-overload]
+    k_genvslite = OptionKey('genvslite')
+    genvsliteval = options.cmd_line_options.pop(k_genvslite)
     # The command line may specify a '--backend' option, which doesn't make sense in conjunction with
     # '--genvslite', where we always want to use a ninja back end -
-    k_backend = 'backend'
+    k_backend = OptionKey('backend')
     if k_backend in options.cmd_line_options.keys():
-        if options.cmd_line_options[k_backend] != 'ninja': # type: ignore [index]
+        if options.cmd_line_options[k_backend] != 'ninja':
             raise MesonException('Explicitly specifying a backend option with \'genvslite\' is not necessary '
                                  '(the ninja backend is always used) but specifying a non-ninja backend '
                                  'conflicts with a \'genvslite\' setup')
     else:
-        options.cmd_line_options[k_backend] = 'ninja' # type: ignore [index]
+        options.cmd_line_options[k_backend] = 'ninja'
     buildtypes_list = coredata.get_genvs_default_buildtype_list()
     vslite_ctx = {}
 
@@ -371,7 +369,7 @@ def run_genvslite_setup(options: CMDOptions) -> None:
         vslite_ctx[buildtypestr] = app.generate(capture=True)
     #Now for generating the 'lite' solution and project files, which will use these builds we've just set up, above.
     options.builddir = f'{builddir_prefix}_vs'
-    options.cmd_line_options[OptionKey('genvslite')] = genvsliteval
+    options.cmd_line_options[k_genvslite] = genvsliteval
     app = MesonApp(options)
     app.generate(capture=False, vslite_ctx=vslite_ctx)
 
@@ -387,7 +385,7 @@ def run(options: T.Union[CMDOptions, T.List[str]]) -> int:
     # lie
     options.pager = False
 
-    if 'genvslite' in options.cmd_line_options.keys():
+    if OptionKey('genvslite') in options.cmd_line_options.keys():
         run_genvslite_setup(options)
     else:
         app = MesonApp(options)
