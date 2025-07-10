@@ -38,7 +38,6 @@ if T.TYPE_CHECKING:
     from . import dependencies
     from .compilers.compilers import Compiler, CompileResult, RunResult, CompileCheckMode
     from .dependencies.detect import TV_DepID
-    from .environment import Environment
     from .mesonlib import FileOrString
     from .cmake.traceparser import CMakeCacheEntry
     from .interpreterbase import SubProject
@@ -416,8 +415,8 @@ class CoreData:
     def set_from_configure_command(self, options: SharedCMDOptions) -> bool:
         unset_opts = getattr(options, 'unset_opts', [])
         all_D = options.projectoptions[:]
-        for keystr, valstr in options.cmd_line_options.items():
-            all_D.append(f'{keystr}={valstr}')
+        for key, valstr in options.cmd_line_options.items():
+            all_D.append(f'{key!s}={valstr}')
         return self.optstore.set_from_configure_command(all_D, unset_opts)
 
     def set_option(self, key: OptionKey, value, first_invocation: bool = False) -> bool:
@@ -584,16 +583,6 @@ class CoreData:
             else:
                 self.optstore.add_compiler_option(lang, k, o)
 
-    def add_lang_args(self, lang: str, comp: T.Type['Compiler'],
-                      for_machine: MachineChoice, env: 'Environment') -> None:
-        """Add global language arguments that are needed before compiler/linker detection."""
-        from .compilers import compilers
-        # These options are all new at this point, because the compiler is
-        # responsible for adding its own options, thus calling
-        # `self.optstore.update()`` is perfectly safe.
-        for gopt_key, gopt_valobj in compilers.get_global_options(lang, comp, for_machine, env).items():
-            self.optstore.add_compiler_option(lang, gopt_key, gopt_valobj)
-
     def process_compiler_options(self, lang: str, comp: Compiler, subproject: str) -> None:
         self.add_compiler_options(comp.get_options(), lang, comp.for_machine)
 
@@ -712,9 +701,10 @@ def parse_cmd_line_options(args: SharedCMDOptions) -> None:
     args.cmd_line_options = {}
     for o in args.projectoptions:
         try:
-            (key, value) = o.split('=', 1)
+            keystr, value = o.split('=', 1)
         except ValueError:
             raise MesonException(f'Option {o!r} must have a value separated by equals sign.')
+        key = OptionKey.from_string(keystr)
         args.cmd_line_options[key] = value
 
     # Merge builtin options set with --option into the dict.
@@ -730,7 +720,7 @@ def parse_cmd_line_options(args: SharedCMDOptions) -> None:
                 cmdline_name = options.argparse_name_to_arg(name)
                 raise MesonException(
                     f'Got argument {name} as both -D{name} and {cmdline_name}. Pick one.')
-            args.cmd_line_options[key.name] = value
+            args.cmd_line_options[key] = value
             delattr(args, name)
 
 
