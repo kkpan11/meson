@@ -79,9 +79,13 @@ class CommandTests(unittest.TestCase):
         # If this call hangs CI will just abort. It is very hard to distinguish
         # between CI issue and test bug in that case. Set timeout and fail loud
         # instead.
-        p = subprocess.run(command, stdout=subprocess.PIPE,
-                           env=env, text=True,
-                           cwd=workdir, timeout=60 * 5)
+        p = subprocess.run(command,
+                           stdout=subprocess.PIPE,
+                           env=env,
+                           encoding='utf-8',
+                           text=True,
+                           cwd=workdir,
+                           timeout=60 * 5)
         print(p.stdout)
         if p.returncode != 0:
             raise subprocess.CalledProcessError(p.returncode, command)
@@ -143,7 +147,7 @@ class CommandTests(unittest.TestCase):
         os.environ['PATH'] = str(bindir) + os.pathsep + os.environ['PATH']
         self._run(python_command + ['setup.py', 'install', '--prefix', str(prefix)])
         # Fix importlib-metadata by appending all dirs in pylibdir
-        PYTHONPATHS = [pylibdir] + [x for x in pylibdir.iterdir()]
+        PYTHONPATHS = [pylibdir] + [x for x in pylibdir.iterdir() if x.name.endswith('.egg')]
         PYTHONPATHS = [os.path.join(str(x), '') for x in PYTHONPATHS]
         os.environ['PYTHONPATH'] = os.pathsep.join(PYTHONPATHS)
         # Check that all the files were installed correctly

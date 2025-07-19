@@ -500,11 +500,6 @@ class NinjaBackend(backends.Backend):
         # - https://github.com/mesonbuild/meson/pull/9453
         # - https://github.com/mesonbuild/meson/issues/9479#issuecomment-953485040
         self.allow_thin_archives = PerMachine[bool](True, True)
-        if self.environment:
-            for for_machine in MachineChoice:
-                if 'cuda' in self.environment.coredata.compilers[for_machine]:
-                    mlog.debug('cuda enabled globally, disabling thin archives for {}, since nvcc/nvlink cannot handle thin archives natively'.format(for_machine))
-                    self.allow_thin_archives[for_machine] = False
 
     def create_phony_target(self, dummy_outfile: str, rulename: str, phony_infilename: str) -> NinjaBuildElement:
         '''
@@ -595,6 +590,12 @@ class NinjaBackend(backends.Backend):
             # We don't yet have a use case where we'd expect to make use of this,
             # so no harm in catching and reporting something unexpected.
             raise MesonBugException('We do not expect the ninja backend to be given a valid \'vslite_ctx\'')
+        if self.environment:
+            for for_machine in MachineChoice:
+                if 'cuda' in self.environment.coredata.compilers[for_machine]:
+                    mlog.debug('cuda enabled globally, disabling thin archives for {}, since nvcc/nvlink cannot handle thin archives natively'.format(for_machine))
+                    self.allow_thin_archives[for_machine] = False
+
         ninja = environment.detect_ninja_command_and_version(log=True)
         if self.environment.coredata.optstore.get_value_for(OptionKey('vsenv')):
             builddir = Path(self.environment.get_build_dir())
@@ -1223,6 +1224,7 @@ class NinjaBackend(backends.Backend):
                                                 capture=ofilenames[0] if target.capture else None,
                                                 feed=srcs[0] if target.feed else None,
                                                 env=target.env,
+                                                can_use_rsp_file=target.rspable,
                                                 verbose=target.console)
         if reason:
             cmd_type = f' (wrapped by meson {reason})'
@@ -1765,6 +1767,9 @@ class NinjaBackend(backends.Backend):
                 girname = os.path.join(self.get_target_dir(target), target.vala_gir)
                 args += ['--gir', os.path.join('..', target.vala_gir)]
                 valac_outputs.append(girname)
+                shared_target = target.get('shared')
+                if isinstance(shared_target, build.SharedLibrary):
+                    args += ['--shared-library', self.get_target_filename_for_linking(shared_target)]
                 # Install GIR to default location if requested by user
                 if len(target.install_dir) > 3 and target.install_dir[3] is True:
                     target.install_dir[3] = os.path.join(self.environment.get_datadir(), 'gir-1.0')
@@ -1775,7 +1780,7 @@ class NinjaBackend(backends.Backend):
                 gres_xml, = self.get_custom_target_sources(gensrc)
                 args += ['--gresources=' + gres_xml]
                 for source_dir in gensrc.source_dirs:
-                    gres_dirs += [os.path.join(self.get_target_dir(gensrc), source_dir)]
+                    gres_dirs += [source_dir]
                 # Ensure that resources are built before vala sources
                 # This is required since vala code using [GtkTemplate] effectively depends on .ui files
                 # GResourceHeaderTarget is not suitable due to lacking depfile
@@ -2091,20 +2096,24 @@ class NinjaBackend(backends.Backend):
             for a in e.get_link_args():
                 if a in rustc.native_static_libs:
                     # Exclude link args that rustc already add by default
-                    pass
+                    continue
                 elif a.startswith('-L'):
                     args.append(a)
-                elif a.endswith(('.dll', '.so', '.dylib', '.a', '.lib')) and isinstance(target, build.StaticLibrary):
+                    continue
+                elif a.endswith(('.dll', '.so', '.dylib', '.a', '.lib')):
                     dir_, lib = os.path.split(a)
                     linkdirs.add(dir_)
-                    if not verbatim:
-                        lib, ext = os.path.splitext(lib)
-                        if lib.startswith('lib'):
-                            lib = lib[3:]
-                    static = a.endswith(('.a', '.lib'))
-                    _link_library(lib, static)
-                else:
-                    args.append(f'-Clink-arg={a}')
+
+                    if isinstance(target, build.StaticLibrary):
+                        if not verbatim:
+                            lib, ext = os.path.splitext(lib)
+                            if lib.startswith('lib'):
+                                lib = lib[3:]
+                        static = a.endswith(('.a', '.lib'))
+                        _link_library(lib, static)
+                        continue
+
+                args.append(f'-Clink-arg={a}')
 
         for d in linkdirs:
             d = d or '.'
@@ -2119,13 +2128,27 @@ class NinjaBackend(backends.Backend):
                                    and dep.rust_crate_type == 'dylib'
                                    for dep in target_deps)
 
-        if target.rust_crate_type in {'dylib', 'proc-macro'} or has_rust_shared_deps:
-            # add prefer-dynamic if any of the Rust libraries we link
+        if target.rust_crate_type in {'dylib', 'proc-macro'}:
+            # also add prefer-dynamic if any of the Rust libraries we link
             # against are dynamic or this is a dynamic library itself,
             # otherwise we'll end up with multiple implementations of libstd.
-            args += ['-C', 'prefer-dynamic']
+            has_rust_shared_deps = True
+        elif self.get_target_option(target, 'rust_dynamic_std'):
+            if target.rust_crate_type == 'staticlib':
+                # staticlib crates always include a copy of the Rust libstd,
+                # therefore it is not possible to also link it dynamically.
+                # The options to avoid this (-Z staticlib-allow-rdylib-deps and
+                # -Z staticlib-prefer-dynamic) are not yet stable; alternatively,
+                # one could use "--emit obj" (implemented in the pull request at
+                # https://github.com/mesonbuild/meson/pull/11213) or "--emit rlib"
+                # (officially not recommended for linking with C programs).
+                raise MesonException('rust_dynamic_std does not support staticlib crates yet')
+            # want libstd as a shared dep
+            has_rust_shared_deps = True
 
-        if isinstance(target, build.SharedLibrary) or has_shared_deps:
+        if has_rust_shared_deps:
+            args += ['-C', 'prefer-dynamic']
+        if has_shared_deps or has_rust_shared_deps:
             args += self.get_build_rpath_args(target, rustc)
 
         return deps, fortran_order_deps, project_deps, args
@@ -2261,6 +2284,10 @@ class NinjaBackend(backends.Backend):
         os.makedirs(self.get_target_private_dir_abs(target), exist_ok=True)
         compile_args = self.generate_basic_compiler_args(target, swiftc)
         compile_args += swiftc.get_module_args(module_name)
+        if mesonlib.version_compare(swiftc.version, '>=5.9'):
+            compile_args += swiftc.get_cxx_interoperability_args(target.compilers)
+        compile_args += self.build.get_project_args(swiftc, target.subproject, target.for_machine)
+        compile_args += self.build.get_global_args(swiftc, target.for_machine)
         for i in reversed(target.get_include_dirs()):
             basedir = i.get_curdir()
             for d in i.get_incdirs():
@@ -3127,9 +3154,9 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         # If TASKING compiler family is used and MIL linking is enabled for the target,
         # then compilation rule name is a special one to output MIL files
         # instead of object files for .c files
-        key = OptionKey('b_lto')
         if compiler.get_id() == 'tasking':
-            if ((isinstance(target, build.StaticLibrary) and target.prelink) or target.get_option(key)) and src.rsplit('.', 1)[1] in compilers.lang_suffixes['c']:
+            target_lto = self.get_target_option(target, OptionKey('b_lto', machine=target.for_machine, subproject=target.subproject))
+            if ((isinstance(target, build.StaticLibrary) and target.prelink) or target_lto) and src.rsplit('.', 1)[1] in compilers.lang_suffixes['c']:
                 compiler_name = self.get_compiler_rule_name('tasking_mil_compile', compiler.for_machine)
             else:
                 compiler_name = self.compiler_to_rule_name(compiler)
@@ -3344,7 +3371,7 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
     def get_target_shsym_filename(self, target):
         # Always name the .symbols file after the primary build output because it always exists
         targetdir = self.get_target_private_dir(target)
-        return os.path.join(targetdir, target.get_filename() + '.symbols')
+        return Path(targetdir, target.get_filename() + '.symbols').as_posix()
 
     def generate_shsym(self, target) -> None:
         target_file = self.get_target_filename(target)
@@ -3363,7 +3390,7 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         self.add_build(elem)
 
     def get_import_filename(self, target) -> str:
-        return os.path.join(self.get_target_dir(target), target.import_filename)
+        return Path(self.get_target_dir(target), target.import_filename).as_posix()
 
     def get_target_type_link_args(self, target, linker):
         commands = []
@@ -3688,7 +3715,7 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         elem = NinjaBuildElement(self.all_outputs, outname, linker_rule, obj_list, implicit_outs=implicit_outs)
         elem.add_dep(dep_targets + custom_target_libraries)
         if linker.get_id() == 'tasking':
-            if len([x for x in dep_targets + custom_target_libraries if x.endswith('.ma')]) > 0 and not target.get_option(OptionKey('b_lto')):
+            if len([x for x in dep_targets + custom_target_libraries if x.endswith('.ma')]) > 0 and not self.get_target_option(target, OptionKey('b_lto', target.subproject, target.for_machine)):
                 raise MesonException(f'Tried to link the target named \'{target.name}\' with a MIL archive without LTO enabled! This causes the compiler to ignore the archive.')
 
         # Compiler args must be included in TI C28x linker commands.

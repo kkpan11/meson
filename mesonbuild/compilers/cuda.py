@@ -198,6 +198,7 @@ class CudaCompiler(Compiler):
             for level, flags in host_compiler.warn_args.items()
         }
         self.host_werror_args = ['-Xcompiler=' + x for x in self.host_compiler.get_werror_args()]
+        self.debug_macros_available = version_compare(self.version, '>=12.9')
 
     @classmethod
     def _shield_nvcc_list_arg(cls, arg: str, listmode: bool = True) -> str:
@@ -763,8 +764,8 @@ class CudaCompiler(Compiler):
         return self._to_host_flags(self.host_compiler.get_std_exe_link_args(), Phase.LINKER)
 
     def find_library(self, libname: str, env: 'Environment', extra_dirs: T.List[str],
-                     libtype: LibType = LibType.PREFER_SHARED, lib_prefix_warning: bool = True) -> T.Optional[T.List[str]]:
-        return self.host_compiler.find_library(libname, env, extra_dirs, libtype, lib_prefix_warning)
+                     libtype: LibType = LibType.PREFER_SHARED, lib_prefix_warning: bool = True, ignore_system_dirs: bool = False) -> T.Optional[T.List[str]]:
+        return self.host_compiler.find_library(libname, env, extra_dirs, libtype, lib_prefix_warning, ignore_system_dirs)
 
     def get_crt_compile_args(self, crt_val: str, buildtype: str) -> T.List[str]:
         return self._to_host_flags(self.host_compiler.get_crt_compile_args(crt_val, buildtype))
@@ -808,7 +809,12 @@ class CudaCompiler(Compiler):
         return ['-Xcompiler=' + x for x in self.host_compiler.get_profile_use_args()]
 
     def get_assert_args(self, disable: bool, env: 'Environment') -> T.List[str]:
-        return self.host_compiler.get_assert_args(disable, env)
+        cccl_macros = []
+        if not disable and self.debug_macros_available:
+            # https://github.com/NVIDIA/cccl/pull/2382
+            cccl_macros = ['-DCCCL_ENABLE_ASSERTIONS=1']
+
+        return self.host_compiler.get_assert_args(disable, env) + cccl_macros
 
     def has_multi_arguments(self, args: T.List[str], env: Environment) -> T.Tuple[bool, bool]:
         args = self._to_host_flags(args)

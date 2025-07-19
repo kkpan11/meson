@@ -29,7 +29,7 @@ from ..mesonlib import (
     File, MachineChoice, MesonException, MesonBugException, OrderedSet,
     ExecutableSerialisation, EnvironmentException,
     classify_unity_sources, get_compiler_for_source,
-    is_parent_path,
+    is_parent_path, get_rsp_threshold,
 )
 from ..options import OptionKey
 
@@ -150,7 +150,7 @@ class TargetInstallData:
     def __post_init__(self, outdir_name: T.Optional[str]) -> None:
         if outdir_name is None:
             outdir_name = os.path.join('{prefix}', self.outdir)
-        self.out_name = os.path.join(outdir_name, os.path.basename(self.fname))
+        self.out_name = Path(outdir_name, os.path.basename(self.fname)).as_posix()
 
 @dataclass(eq=False)
 class InstallEmptyDir:
@@ -307,16 +307,16 @@ class Backend:
         else:
             assert isinstance(t, build.BuildTarget), t
             filename = t.get_filename()
-        return os.path.join(self.get_target_dir(t), filename)
+        return Path(self.get_target_dir(t), filename).as_posix()
 
     def get_target_filename_abs(self, target: T.Union[build.Target, build.CustomTargetIndex]) -> str:
-        return os.path.join(self.environment.get_build_dir(), self.get_target_filename(target))
+        return Path(self.environment.get_build_dir(), self.get_target_filename(target)).as_posix()
 
     def get_target_debug_filename(self, target: build.BuildTarget) -> T.Optional[str]:
         assert isinstance(target, build.BuildTarget), target
         if target.get_debug_filename():
             debug_filename = target.get_debug_filename()
-            return os.path.join(self.get_target_dir(target), debug_filename)
+            return Path(self.get_target_dir(target), debug_filename).as_posix()
         else:
             return None
 
@@ -324,7 +324,7 @@ class Backend:
         assert isinstance(target, build.BuildTarget), target
         if not target.get_debug_filename():
             return None
-        return os.path.join(self.environment.get_build_dir(), self.get_target_debug_filename(target))
+        return Path(self.environment.get_build_dir(), self.get_target_debug_filename(target)).as_posix()
 
     def get_source_dir_include_args(self, target: build.BuildTarget, compiler: 'Compiler', *, absolute_path: bool = False) -> T.List[str]:
         curdir = target.get_subdir()
@@ -533,6 +533,7 @@ class Backend:
             capture: T.Optional[str] = None,
             feed: T.Optional[str] = None,
             env: T.Optional[mesonlib.EnvironmentVariables] = None,
+            can_use_rsp_file: bool = False,
             tag: T.Optional[str] = None,
             verbose: bool = False,
             installdir_map: T.Optional[T.Dict[str, str]] = None) -> 'ExecutableSerialisation':
@@ -563,9 +564,7 @@ class Backend:
         cmd_args: T.List[str] = []
         for c in raw_cmd_args:
             if isinstance(c, programs.ExternalProgram):
-                p = c.get_path()
-                assert isinstance(p, str)
-                cmd_args.append(p)
+                cmd_args += c.get_command()
             elif isinstance(c, (build.BuildTarget, build.CustomTarget)):
                 cmd_args.append(self.get_target_filename_abs(c))
             elif isinstance(c, mesonlib.File):
@@ -594,6 +593,21 @@ class Backend:
             exe_wrapper = None
 
         workdir = workdir or self.environment.get_build_dir()
+
+        # Must include separators as well
+        needs_rsp_file = can_use_rsp_file and sum(len(i) + 1 for i in cmd_args) >= get_rsp_threshold()
+
+        if needs_rsp_file:
+            hasher = hashlib.sha1()
+            args = ' '.join(mesonlib.quote_arg(arg) for arg in cmd_args)
+            hasher.update(args.encode(encoding='utf-8', errors='ignore'))
+            digest = hasher.hexdigest()
+            scratch_file = f'meson_rsp_{digest}.rsp'
+            rsp_file = os.path.join(self.environment.get_scratch_dir(), scratch_file)
+            with open(rsp_file, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(args)
+                cmd_args = [f'@{rsp_file}']
+
         return ExecutableSerialisation(exe_cmd + cmd_args, env,
                                        exe_wrapper, workdir,
                                        extra_paths, capture, feed, tag, verbose, installdir_map)
@@ -606,6 +620,7 @@ class Backend:
                              feed: T.Optional[str] = None,
                              force_serialize: bool = False,
                              env: T.Optional[mesonlib.EnvironmentVariables] = None,
+                             can_use_rsp_file: bool = False,
                              verbose: bool = False) -> T.Tuple[T.List[str], str]:
         '''
         Serialize an executable for running with a generator or a custom target
@@ -613,7 +628,7 @@ class Backend:
         cmd: T.List[T.Union[str, mesonlib.File, build.BuildTarget, build.CustomTarget, programs.ExternalProgram]] = []
         cmd.append(exe)
         cmd.extend(cmd_args)
-        es = self.get_executable_serialisation(cmd, workdir, extra_bdeps, capture, feed, env, verbose=verbose)
+        es = self.get_executable_serialisation(cmd, workdir, extra_bdeps, capture, feed, env, can_use_rsp_file, verbose=verbose)
         reasons: T.List[str] = []
         if es.extra_paths:
             reasons.append('to set PATH')
@@ -652,6 +667,9 @@ class Backend:
             for k, v in env.get_env({}).items():
                 envlist.append(f'{k}={v}')
             return ['env'] + envlist + es.cmd_args, ', '.join(reasons)
+
+        if any(a.startswith('@') for a in es.cmd_args):
+            reasons.append('because command is too long')
 
         if not force_serialize:
             if not capture and not feed:
@@ -1067,11 +1085,6 @@ class Backend:
             if compiler.language == 'vala':
                 if dep.type_name == 'pkgconfig':
                     assert isinstance(dep, dependencies.ExternalDependency)
-                    if dep.name == 'glib-2.0' and dep.version_reqs is not None:
-                        for req in dep.version_reqs:
-                            if req.startswith(('>=', '==')):
-                                commands += ['--target-glib', req[2:]]
-                                break
                     commands += ['--pkg', dep.name]
                 elif isinstance(dep, dependencies.ExternalLibrary):
                     commands += dep.get_link_args('vala')
@@ -1083,6 +1096,32 @@ class Backend:
                 commands += dep.get_exe_args(compiler)
             # For 'automagic' deps: Boost and GTest. Also dependency('threads').
             # pkg-config puts the thread flags itself via `Cflags:`
+        if compiler.language == 'vala':
+            # Vala wants to know the minimum glib version
+            for dep in target.added_deps:
+                if dep.name == 'glib-2.0':
+                    if dep.type_name == 'pkgconfig':
+                        assert isinstance(dep, dependencies.ExternalDependency)
+                        if dep.version_reqs is not None:
+                            for req in dep.version_reqs:
+                                if req.startswith(('>=', '==')):
+                                    commands += ['--target-glib', req[2:]]
+                                    break
+                    elif isinstance(dep, dependencies.InternalDependency) and dep.version is not None:
+                        glib_version = dep.version.split('.')
+                        if len(glib_version) != 3:
+                            mlog.warning(f'GLib version has unexpected format: {dep.version}')
+                            break
+                        try:
+                            # If GLib version is a development version, downgrade
+                            # --target-glib to the previous version, as valac will
+                            # complain about non-even minor versions
+                            glib_version[1] = str((int(glib_version[1]) // 2) * 2)
+                        except ValueError:
+                            mlog.warning(f'GLib version has unexpected format: {dep.version}')
+                            break
+                        commands += ['--target-glib', f'{glib_version[0]}.{glib_version[1]}']
+
         # Fortran requires extra include directives.
         if compiler.language == 'fortran':
             for lt in chain(target.link_targets, target.link_whole_targets):
@@ -1258,12 +1297,9 @@ class Backend:
                 extra_bdeps: T.List[T.Union[build.BuildTarget, build.CustomTarget, build.CustomTargetIndex]] = []
                 if isinstance(exe, build.CustomTarget):
                     extra_bdeps = list(exe.get_transitive_build_target_deps())
+                extra_bdeps.extend(t.depends)
+                extra_bdeps.extend(a for a in t.cmd_args if isinstance(a, build.BuildTarget))
                 extra_paths = self.determine_windows_extra_paths(exe, extra_bdeps)
-                for a in t.cmd_args:
-                    if isinstance(a, build.BuildTarget):
-                        for p in self.determine_windows_extra_paths(a, []):
-                            if p not in extra_paths:
-                                extra_paths.append(p)
             else:
                 extra_paths = []
 
@@ -1289,8 +1325,12 @@ class Backend:
                 else:
                     raise MesonException('Bad object in test command.')
 
+            # set LD_LIBRARY_PATH for
+            # a) dependencies, as relying on rpath is not very safe:
+            #    https://github.com/mesonbuild/meson/pull/11119
+            # b) depends and targets passed via args.
             t_env = copy.deepcopy(t.env)
-            if not machine.is_windows() and not machine.is_cygwin() and not machine.is_darwin():
+            if not machine.is_windows() and not machine.is_cygwin():
                 ld_lib_path_libs: T.Set[build.SharedLibrary] = set()
                 for d in depends:
                     if isinstance(d, build.BuildTarget):
@@ -1303,6 +1343,8 @@ class Backend:
 
                 if ld_lib_path:
                     t_env.prepend('LD_LIBRARY_PATH', list(ld_lib_path), ':')
+                    if machine.is_darwin():
+                        t_env.prepend('DYLD_LIBRARY_PATH', list(ld_lib_path), ':')
 
             ts = TestSerialisation(t.get_name(), t.project_name, t.suite, cmd, is_cross,
                                    exe_wrapper, self.environment.need_exe_wrapper(),
@@ -1562,7 +1604,7 @@ class Backend:
 
     def eval_custom_target_command(
             self, target: build.CustomTarget, absolute_outputs: bool = False) -> \
-            T.Tuple[T.List[str], T.List[str], T.List[str]]:
+            T.Tuple[T.List[str], T.List[str], T.List[str | programs.ExternalProgram]]:
         # We want the outputs to be absolute only when using the VS backend
         # XXX: Maybe allow the vs backend to use relative paths too?
         source_root = self.build_to_src
@@ -1575,7 +1617,7 @@ class Backend:
         outputs = [os.path.join(outdir, i) for i in target.get_outputs()]
         inputs = self.get_custom_target_sources(target)
         # Evaluate the command list
-        cmd: T.List[str] = []
+        cmd: T.List[str | programs.ExternalProgram] = []
         for i in target.command:
             if isinstance(i, build.BuildTarget):
                 cmd += self.build_target_to_cmd_array(i)
@@ -1611,6 +1653,9 @@ class Backend:
                     if not target.absolute_paths:
                         pdir = self.get_target_private_dir(target)
                     i = i.replace('@PRIVATE_DIR@', pdir)
+            elif isinstance(i, programs.ExternalProgram):
+                # Let it pass and be extended elsewhere
+                pass
             else:
                 raise RuntimeError(f'Argument {i} is of unknown type {type(i)}')
             cmd.append(i)
@@ -1635,7 +1680,7 @@ class Backend:
         # fixed.
         #
         # https://github.com/mesonbuild/meson/pull/737
-        cmd = [i.replace('\\', '/') for i in cmd]
+        cmd = [i.replace('\\', '/') if isinstance(i, str) else i for i in cmd]
         return inputs, outputs, cmd
 
     def get_introspect_command(self) -> str:
@@ -1996,6 +2041,8 @@ class Backend:
                         compiler += [j]
                     elif isinstance(j, (build.BuildTarget, build.CustomTarget)):
                         compiler += j.get_outputs()
+                    elif isinstance(j, programs.ExternalProgram):
+                        compiler += j.get_command()
                     else:
                         raise RuntimeError(f'Type "{type(j).__name__}" is not supported in get_introspection_data. This is a bug')
 
