@@ -29,7 +29,7 @@ import mesonbuild.coredata
 import mesonbuild.machinefile
 import mesonbuild.modules.gnome
 from mesonbuild.mesonlib import (
-    BuildDirLock, MachineChoice, is_windows, is_osx, is_cygwin, is_dragonflybsd,
+    DirectoryLock, DirectoryLockAction, MachineChoice, is_windows, is_osx, is_cygwin, is_dragonflybsd,
     is_sunos, windows_proof_rmtree, python_command, version_compare, split_args, quote_arg,
     relpath, is_linux, git, search_version, do_conf_file, do_conf_str, default_prefix,
     MesonException, EnvironmentException,
@@ -221,6 +221,47 @@ class AllPlatformTests(BasePlatformTests):
         #   Dict value in confdata
         confdata.values = {'VAR': (['value'], 'description')}
         self.assertRaises(MesonException, conf_str, ['#mesondefine VAR'], confdata, 'meson')
+
+    def test_cmake_configuration(self):
+        if self.backend is not Backend.ninja:
+            raise SkipTest('ninja backend needed to configure with cmake')
+
+        cmake = ExternalProgram('cmake')
+        if not cmake.found():
+            raise SkipTest('cmake not available')
+
+        cmake_version = cmake.get_version()
+        if not version_compare(cmake_version, '>=3.13.5'):
+            raise SkipTest('cmake is too old')
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            srcdir = os.path.join(tmpdir, 'src')
+
+            shutil.copytree(os.path.join(self.src_root, 'test cases', 'common', '14 configure file'), srcdir)
+            self.init(srcdir)
+
+            cmake_builddir = os.path.join(srcdir, "cmake_builddir")
+            self.assertNotEqual(self.builddir, cmake_builddir)
+            self._run([cmake.path, '-G', 'Ninja', '-S', srcdir, '-B', cmake_builddir])
+
+            header_list = [
+                'config7.h',
+                'config10.h',
+            ]
+
+            for header in header_list:
+                meson_header = ""
+                cmake_header = ""
+
+                with open(os.path.join(self.builddir, header), encoding='utf-8') as f:
+                    meson_header = f.read()
+
+                cmake_header_path = os.path.join(cmake_builddir, header)
+                with open(os.path.join(cmake_builddir, header), encoding='utf-8') as f:
+                    cmake_header = f.read()
+
+                self.assertTrue(cmake_header, f'cmake generated header {header} is empty')
+                self.assertEqual(cmake_header, meson_header)
 
     def test_absolute_prefix_libdir(self):
         '''
@@ -1099,110 +1140,144 @@ class AllPlatformTests(BasePlatformTests):
         for lang, evar in langs:
             # Detect with evar and do sanity checks on that
             if evar in os.environ:
-                ecc = compiler_from_language(env, lang, MachineChoice.HOST)
-                self.assertTrue(ecc.version)
-                elinker = detect_static_linker(env, ecc)
-                # Pop it so we don't use it for the next detection
-                evalue = os.environ.pop(evar)
-                # Very rough/strict heuristics. Would never work for actual
-                # compiler detection, but should be ok for the tests.
-                ebase = os.path.basename(evalue)
-                if ebase.startswith('g') or ebase.endswith(('-gcc', '-g++')):
-                    self.assertIsInstance(ecc, gnu)
-                    self.assertIsInstance(elinker, ar)
-                elif 'clang-cl' in ebase:
-                    self.assertIsInstance(ecc, clangcl)
-                    self.assertIsInstance(elinker, lib)
-                elif 'clang' in ebase:
-                    self.assertIsInstance(ecc, clang)
-                    self.assertIsInstance(elinker, ar)
-                elif ebase.startswith('ic'):
-                    self.assertIsInstance(ecc, intel)
-                    self.assertIsInstance(elinker, ar)
-                elif ebase.startswith('cl'):
-                    self.assertIsInstance(ecc, msvc)
-                    self.assertIsInstance(elinker, lib)
-                else:
-                    raise AssertionError(f'Unknown compiler {evalue!r}')
-                # Check that we actually used the evalue correctly as the compiler
-                self.assertEqual(ecc.get_exelist(), split_args(evalue))
-            # Do auto-detection of compiler based on platform, PATH, etc.
-            cc = compiler_from_language(env, lang, MachineChoice.HOST)
-            self.assertTrue(cc.version)
-            linker = detect_static_linker(env, cc)
-            # Check compiler type
-            if isinstance(cc, gnu):
-                self.assertIsInstance(linker, ar)
-                if is_osx():
-                    self.assertIsInstance(cc.linker, linkers.AppleDynamicLinker)
-                elif is_sunos():
-                    self.assertIsInstance(cc.linker, (linkers.SolarisDynamicLinker, linkers.GnuLikeDynamicLinkerMixin))
-                else:
-                    self.assertIsInstance(cc.linker, linkers.GnuLikeDynamicLinkerMixin)
-            if isinstance(cc, clangcl):
-                self.assertIsInstance(linker, lib)
-                self.assertIsInstance(cc.linker, linkers.ClangClDynamicLinker)
-            if isinstance(cc, clang):
-                self.assertIsInstance(linker, ar)
-                if is_osx():
-                    self.assertIsInstance(cc.linker, linkers.AppleDynamicLinker)
-                elif is_windows():
-                    # This is clang, not clang-cl. This can be either an
-                    # ld-like linker of link.exe-like linker (usually the
-                    # former for msys2, the latter otherwise)
-                    self.assertIsInstance(cc.linker, (linkers.MSVCDynamicLinker, linkers.GnuLikeDynamicLinkerMixin))
-                elif is_sunos():
-                    self.assertIsInstance(cc.linker, (linkers.SolarisDynamicLinker, linkers.GnuLikeDynamicLinkerMixin))
-                else:
-                    self.assertIsInstance(cc.linker, linkers.GnuLikeDynamicLinkerMixin)
-            if isinstance(cc, intel):
-                self.assertIsInstance(linker, ar)
-                if is_osx():
-                    self.assertIsInstance(cc.linker, linkers.AppleDynamicLinker)
-                elif is_windows():
-                    self.assertIsInstance(cc.linker, linkers.XilinkDynamicLinker)
-                else:
-                    self.assertIsInstance(cc.linker, linkers.GnuDynamicLinker)
-            if isinstance(cc, msvc):
-                self.assertTrue(is_windows())
-                self.assertIsInstance(linker, lib)
-                self.assertEqual(cc.id, 'msvc')
-                self.assertTrue(hasattr(cc, 'is_64'))
-                self.assertIsInstance(cc.linker, linkers.MSVCDynamicLinker)
-                # If we're on Windows CI, we know what the compiler will be
-                if 'arch' in os.environ:
-                    if os.environ['arch'] == 'x64':
-                        self.assertTrue(cc.is_64)
+                with self.subTest(lang=lang, evar=evar):
+                    try:
+                        ecc = compiler_from_language(env, lang, MachineChoice.HOST)
+                    except EnvironmentException:
+                        # always raise in ci, we expect to have a valid ObjC and ObjC++ compiler of some kind
+                        if is_ci():
+                            self.fail(f'Could not find a compiler for {lang}')
+                        if sys.version_info < (3, 11):
+                            continue
+                        self.skipTest(f'No valid compiler for {lang}.')
+                    finally:
+                        # Pop it so we don't use it for the next detection
+                        evalue = os.environ.pop(evar)
+                    assert ecc is not None, "Something went really wrong"
+                    self.assertTrue(ecc.version)
+                    elinker = detect_static_linker(env, ecc)
+                    # Very rough/strict heuristics. Would never work for actual
+                    # compiler detection, but should be ok for the tests.
+                    ebase = os.path.basename(evalue)
+                    if ebase.startswith('g') or ebase.endswith(('-gcc', '-g++')):
+                        self.assertIsInstance(ecc, gnu)
+                        self.assertIsInstance(elinker, ar)
+                    elif 'clang-cl' in ebase:
+                        self.assertIsInstance(ecc, clangcl)
+                        self.assertIsInstance(elinker, lib)
+                    elif 'clang' in ebase:
+                        self.assertIsInstance(ecc, clang)
+                        self.assertIsInstance(elinker, ar)
+                    elif ebase.startswith('ic'):
+                        self.assertIsInstance(ecc, intel)
+                        self.assertIsInstance(elinker, ar)
+                    elif ebase.startswith('cl'):
+                        self.assertIsInstance(ecc, msvc)
+                        self.assertIsInstance(elinker, lib)
                     else:
-                        self.assertFalse(cc.is_64)
+                        self.fail(f'Unknown compiler {evalue!r}')
+                    # Check that we actually used the evalue correctly as the compiler
+                    self.assertEqual(ecc.get_exelist(), split_args(evalue))
+
+            # Do auto-detection of compiler based on platform, PATH, etc.
+            with self.subTest(lang=lang):
+                try:
+                    cc = compiler_from_language(env, lang, MachineChoice.HOST)
+                except EnvironmentException:
+                    # always raise in ci, we expect to have a valid ObjC and ObjC++ compiler of some kind
+                    if is_ci():
+                        self.fail(f'Could not find a compiler for {lang}')
+                    if sys.version_info < (3, 11):
+                        continue
+                    self.skipTest(f'No valid compiler for {lang}.')
+                assert cc is not None, "Something went really wrong"
+                self.assertTrue(cc.version)
+                linker = detect_static_linker(env, cc)
+                # Check compiler type
+                if isinstance(cc, gnu):
+                    self.assertIsInstance(linker, ar)
+                    if is_osx():
+                        self.assertIsInstance(cc.linker, linkers.AppleDynamicLinker)
+                    elif is_sunos():
+                        self.assertIsInstance(cc.linker, (linkers.SolarisDynamicLinker, linkers.GnuLikeDynamicLinkerMixin))
+                    else:
+                        self.assertIsInstance(cc.linker, linkers.GnuLikeDynamicLinkerMixin)
+                if isinstance(cc, clangcl):
+                    self.assertIsInstance(linker, lib)
+                    self.assertIsInstance(cc.linker, linkers.ClangClDynamicLinker)
+                if isinstance(cc, clang):
+                    self.assertIsInstance(linker, ar)
+                    if is_osx():
+                        self.assertIsInstance(cc.linker, linkers.AppleDynamicLinker)
+                    elif is_windows():
+                        # This is clang, not clang-cl. This can be either an
+                        # ld-like linker of link.exe-like linker (usually the
+                        # former for msys2, the latter otherwise)
+                        self.assertIsInstance(cc.linker, (linkers.MSVCDynamicLinker, linkers.GnuLikeDynamicLinkerMixin))
+                    elif is_sunos():
+                        self.assertIsInstance(cc.linker, (linkers.SolarisDynamicLinker, linkers.GnuLikeDynamicLinkerMixin))
+                    else:
+                        self.assertIsInstance(cc.linker, linkers.GnuLikeDynamicLinkerMixin)
+                if isinstance(cc, intel):
+                    self.assertIsInstance(linker, ar)
+                    if is_osx():
+                        self.assertIsInstance(cc.linker, linkers.AppleDynamicLinker)
+                    elif is_windows():
+                        self.assertIsInstance(cc.linker, linkers.XilinkDynamicLinker)
+                    else:
+                        self.assertIsInstance(cc.linker, linkers.GnuDynamicLinker)
+                if isinstance(cc, msvc):
+                    self.assertTrue(is_windows())
+                    self.assertIsInstance(linker, lib)
+                    self.assertEqual(cc.id, 'msvc')
+                    self.assertTrue(hasattr(cc, 'is_64'))
+                    self.assertIsInstance(cc.linker, linkers.MSVCDynamicLinker)
+                    # If we're on Windows CI, we know what the compiler will be
+                    if 'arch' in os.environ:
+                        if os.environ['arch'] == 'x64':
+                            self.assertTrue(cc.is_64)
+                        else:
+                            self.assertFalse(cc.is_64)
+
             # Set evar ourselves to a wrapper script that just calls the same
             # exelist + some argument. This is meant to test that setting
             # something like `ccache gcc -pipe` or `distcc ccache gcc` works.
-            wrapper = os.path.join(testdir, 'compiler wrapper.py')
-            wrappercc = python_command + [wrapper] + cc.get_exelist() + ['-DSOME_ARG']
-            os.environ[evar] = ' '.join(quote_arg(w) for w in wrappercc)
+            with self.subTest('wrapper script', lang=lang):
+                wrapper = os.path.join(testdir, 'compiler wrapper.py')
+                wrappercc = python_command + [wrapper] + cc.get_exelist() + ['-DSOME_ARG']
+                os.environ[evar] = ' '.join(quote_arg(w) for w in wrappercc)
 
-            # Check static linker too
-            wrapperlinker = python_command + [wrapper] + linker.get_exelist() + linker.get_always_args()
-            os.environ['AR'] = ' '.join(quote_arg(w) for w in wrapperlinker)
+                # Check static linker too
+                wrapperlinker = python_command + [wrapper] + linker.get_exelist() + linker.get_always_args()
+                os.environ['AR'] = ' '.join(quote_arg(w) for w in wrapperlinker)
 
-            # Need a new env to re-run environment loading
-            env = get_fake_env(testdir, self.builddir, self.prefix)
+                # Need a new env to re-run environment loading
+                env = get_fake_env(testdir, self.builddir, self.prefix)
 
-            wcc = compiler_from_language(env, lang, MachineChoice.HOST)
-            wlinker = detect_static_linker(env, wcc)
-            # Pop it so we don't use it for the next detection
-            os.environ.pop('AR')
-            # Must be the same type since it's a wrapper around the same exelist
-            self.assertIs(type(cc), type(wcc))
-            self.assertIs(type(linker), type(wlinker))
-            # Ensure that the exelist is correct
-            self.assertEqual(wcc.get_exelist(), wrappercc)
-            self.assertEqual(wlinker.get_exelist(), wrapperlinker)
-            # Ensure that the version detection worked correctly
-            self.assertEqual(cc.version, wcc.version)
-            if hasattr(cc, 'is_64'):
-                self.assertEqual(cc.is_64, wcc.is_64)
+                try:
+                    wcc = compiler_from_language(env, lang, MachineChoice.HOST)
+                except EnvironmentException:
+                    # always raise in ci, we expect to have a valid ObjC and ObjC++ compiler of some kind
+                    if is_ci():
+                        self.fail(f'Could not find a compiler for {lang}')
+                    if sys.version_info < (3, 11):
+                        continue
+                    self.skipTest(f'No valid compiler for {lang}.')
+                wlinker = detect_static_linker(env, wcc)
+                del os.environ['AR']
+
+                # Must be the same type since it's a wrapper around the same exelist
+                self.assertIs(type(cc), type(wcc))
+                self.assertIs(type(linker), type(wlinker))
+
+                # Ensure that the exelist is correct
+                self.assertEqual(wcc.get_exelist(), wrappercc)
+                self.assertEqual(wlinker.get_exelist(), wrapperlinker)
+
+                # Ensure that the version detection worked correctly
+                self.assertEqual(cc.version, wcc.version)
+                if hasattr(cc, 'is_64'):
+                    self.assertEqual(cc.is_64, wcc.is_64)
 
     def test_always_prefer_c_compiler_for_asm(self):
         testdir = os.path.join(self.common_test_dir, '133 c cpp and asm')
@@ -2499,10 +2574,9 @@ class AllPlatformTests(BasePlatformTests):
     def test_flock(self):
         exception_raised = False
         with tempfile.TemporaryDirectory() as tdir:
-            os.mkdir(os.path.join(tdir, 'meson-private'))
-            with BuildDirLock(tdir):
+            with DirectoryLock(tdir, 'lock', DirectoryLockAction.FAIL, 'failed to lock directory'):
                 try:
-                    with BuildDirLock(tdir):
+                    with DirectoryLock(tdir, 'lock', DirectoryLockAction.FAIL, 'expected failure'):
                         pass
                 except MesonException:
                     exception_raised = True
@@ -3242,10 +3316,15 @@ class AllPlatformTests(BasePlatformTests):
     def test_identity_cross(self):
         testdir = os.path.join(self.unit_test_dir, '69 cross')
         # Do a build to generate a cross file where the host is this target
-        self.init(testdir, extra_args=['-Dgenerate=true'])
+        # build.c_args is ignored here.
+        self.init(testdir, extra_args=['-Dgenerate=true', '-Dc_args=-funroll-loops',
+                                       '-Dbuild.c_args=-pedantic'])
+        self.meson_native_files = [os.path.join(self.builddir, "nativefile")]
+        self.assertTrue(os.path.exists(self.meson_native_files[0]))
         self.meson_cross_files = [os.path.join(self.builddir, "crossfile")]
         self.assertTrue(os.path.exists(self.meson_cross_files[0]))
-        # Now verify that this is detected as cross
+        # Now verify that this is detected as cross and build options are
+        # processed correctly
         self.new_builddir()
         self.init(testdir)
 
@@ -3612,6 +3691,8 @@ class AllPlatformTests(BasePlatformTests):
         # Account for differences in output
         res_wb = [i for i in res_wb if i['type'] != 'custom']
         for i in res_wb:
+            if i['id'] == 'test1@exe':
+                i['build_by_default'] = 'unknown'
             i['filename'] = [os.path.relpath(x, self.builddir) for x in i['filename']]
             for k in ('install_filename', 'dependencies', 'win_subsystem'):
                 if k in i:
@@ -3730,7 +3811,7 @@ class AllPlatformTests(BasePlatformTests):
             },
             {
                 'name': 'bugDep1',
-                'required': True,
+                'required': 'unknown',
                 'version': [],
                 'has_fallback': False,
                 'conditional': False
@@ -4726,124 +4807,145 @@ class AllPlatformTests(BasePlatformTests):
         shared_lib_name = lambda name: output_name(name, SharedLibrary)
         static_lib_name = lambda name: output_name(name, StaticLibrary)
         exe_name = lambda name: output_name(name, Executable)
+        get_path = lambda f: Path(f).as_posix()
 
         expected = {
             'targets': {
-                f'{self.builddir}/out1-notag.txt': {
+                get_path(f'{self.builddir}/out1-notag.txt'): {
+                    'build_rpaths': [],
                     'destination': '{datadir}/out1-notag.txt',
                     'install_rpath': None,
                     'tag': None,
                     'subproject': None,
                 },
-                f'{self.builddir}/out2-notag.txt': {
+                get_path(f'{self.builddir}/out2-notag.txt'): {
+                    'build_rpaths': [],
                     'destination': '{datadir}/out2-notag.txt',
                     'install_rpath': None,
                     'tag': None,
                     'subproject': None,
                 },
-                f'{self.builddir}/libstatic.a': {
+                get_path(f'{self.builddir}/libstatic.a'): {
+                    'build_rpaths': [],
                     'destination': '{libdir_static}/libstatic.a',
                     'install_rpath': None,
                     'tag': 'devel',
                     'subproject': None,
                 },
-                f'{self.builddir}/' + exe_name('app'): {
+                get_path(f'{self.builddir}/' + exe_name('app')): {
+                    'build_rpaths': [],
                     'destination': '{bindir}/' + exe_name('app'),
                     'install_rpath': None,
                     'tag': 'runtime',
                     'subproject': None,
                 },
-                f'{self.builddir}/' + exe_name('app-otherdir'): {
+                get_path(f'{self.builddir}/' + exe_name('app-otherdir')): {
+                    'build_rpaths': [],
                     'destination': '{prefix}/otherbin/' + exe_name('app-otherdir'),
                     'install_rpath': None,
                     'tag': 'runtime',
                     'subproject': None,
                 },
-                f'{self.builddir}/subdir/' + exe_name('app2'): {
+                get_path(f'{self.builddir}/subdir/' + exe_name('app2')): {
+                    'build_rpaths': [],
                     'destination': '{bindir}/' + exe_name('app2'),
                     'install_rpath': None,
                     'tag': 'runtime',
                     'subproject': None,
                 },
-                f'{self.builddir}/' + shared_lib_name('shared'): {
+                get_path(f'{self.builddir}/' + shared_lib_name('shared')): {
+                    'build_rpaths': [],
                     'destination': '{libdir_shared}/' + shared_lib_name('shared'),
                     'install_rpath': None,
                     'tag': 'runtime',
                     'subproject': None,
                 },
-                f'{self.builddir}/' + shared_lib_name('both'): {
+                get_path(f'{self.builddir}/' + shared_lib_name('both')): {
+                    'build_rpaths': [],
                     'destination': '{libdir_shared}/' + shared_lib_name('both'),
                     'install_rpath': None,
                     'tag': 'runtime',
                     'subproject': None,
                 },
-                f'{self.builddir}/' + static_lib_name('both'): {
+                get_path(f'{self.builddir}/' + static_lib_name('both')): {
+                    'build_rpaths': [],
                     'destination': '{libdir_static}/' + static_lib_name('both'),
                     'install_rpath': None,
                     'tag': 'devel',
                     'subproject': None,
                 },
-                f'{self.builddir}/' + shared_lib_name('bothcustom'): {
+                get_path(f'{self.builddir}/' + shared_lib_name('bothcustom')): {
+                    'build_rpaths': [],
                     'destination': '{libdir_shared}/' + shared_lib_name('bothcustom'),
                     'install_rpath': None,
                     'tag': 'custom',
                     'subproject': None,
                 },
-                f'{self.builddir}/' + static_lib_name('bothcustom'): {
+                get_path(f'{self.builddir}/' + static_lib_name('bothcustom')): {
+                    'build_rpaths': [],
                     'destination': '{libdir_static}/' + static_lib_name('bothcustom'),
                     'install_rpath': None,
                     'tag': 'custom',
                     'subproject': None,
                 },
-                f'{self.builddir}/subdir/' + shared_lib_name('both2'): {
+                get_path(f'{self.builddir}/subdir/' + shared_lib_name('both2')): {
+                    'build_rpaths': [],
                     'destination': '{libdir_shared}/' + shared_lib_name('both2'),
                     'install_rpath': None,
                     'tag': 'runtime',
                     'subproject': None,
                 },
-                f'{self.builddir}/subdir/' + static_lib_name('both2'): {
+                get_path(f'{self.builddir}/subdir/' + static_lib_name('both2')): {
+                    'build_rpaths': [],
                     'destination': '{libdir_static}/' + static_lib_name('both2'),
                     'install_rpath': None,
                     'tag': 'devel',
                     'subproject': None,
                 },
-                f'{self.builddir}/out1-custom.txt': {
+                get_path(f'{self.builddir}/out1-custom.txt'): {
+                    'build_rpaths': [],
                     'destination': '{datadir}/out1-custom.txt',
                     'install_rpath': None,
                     'tag': 'custom',
                     'subproject': None,
                 },
-                f'{self.builddir}/out2-custom.txt': {
+                get_path(f'{self.builddir}/out2-custom.txt'): {
+                    'build_rpaths': [],
                     'destination': '{datadir}/out2-custom.txt',
                     'install_rpath': None,
                     'tag': 'custom',
                     'subproject': None,
                 },
-                f'{self.builddir}/out3-custom.txt': {
+                get_path(f'{self.builddir}/out3-custom.txt'): {
+                    'build_rpaths': [],
                     'destination': '{datadir}/out3-custom.txt',
                     'install_rpath': None,
                     'tag': 'custom',
                     'subproject': None,
                 },
-                f'{self.builddir}/subdir/out1.txt': {
+                get_path(f'{self.builddir}/subdir/out1.txt'): {
+                    'build_rpaths': [],
                     'destination': '{datadir}/out1.txt',
                     'install_rpath': None,
                     'tag': None,
                     'subproject': None,
                 },
-                f'{self.builddir}/subdir/out2.txt': {
+                get_path(f'{self.builddir}/subdir/out2.txt'): {
+                    'build_rpaths': [],
                     'destination': '{datadir}/out2.txt',
                     'install_rpath': None,
                     'tag': None,
                     'subproject': None,
                 },
-                f'{self.builddir}/out-devel.h': {
+                get_path(f'{self.builddir}/out-devel.h'): {
+                    'build_rpaths': [],
                     'destination': '{includedir}/out-devel.h',
                     'install_rpath': None,
                     'tag': 'devel',
                     'subproject': None,
                 },
-                f'{self.builddir}/out3-notag.txt': {
+                get_path(f'{self.builddir}/out3-notag.txt'): {
+                    'build_rpaths': [],
                     'destination': '{datadir}/out3-notag.txt',
                     'install_rpath': None,
                     'tag': None,
@@ -4851,80 +4953,80 @@ class AllPlatformTests(BasePlatformTests):
                 },
             },
             'configure': {
-                f'{self.builddir}/foo-notag.h': {
+                get_path(f'{self.builddir}/foo-notag.h'): {
                     'destination': '{datadir}/foo-notag.h',
                     'tag': None,
                     'subproject': None,
                 },
-                f'{self.builddir}/foo2-devel.h': {
+                get_path(f'{self.builddir}/foo2-devel.h'): {
                     'destination': '{includedir}/foo2-devel.h',
                     'tag': 'devel',
                     'subproject': None,
                 },
-                f'{self.builddir}/foo-custom.h': {
+                get_path(f'{self.builddir}/foo-custom.h'): {
                     'destination': '{datadir}/foo-custom.h',
                     'tag': 'custom',
                     'subproject': None,
                 },
-                f'{self.builddir}/subdir/foo2.h': {
+                get_path(f'{self.builddir}/subdir/foo2.h'): {
                     'destination': '{datadir}/foo2.h',
                     'tag': None,
                     'subproject': None,
                 },
             },
             'data': {
-                f'{testdir}/bar-notag.txt': {
+                get_path(f'{testdir}/bar-notag.txt'): {
                     'destination': '{datadir}/bar-notag.txt',
                     'tag': None,
                     'subproject': None,
                 },
-                f'{testdir}/bar-devel.h': {
+                get_path(f'{testdir}/bar-devel.h'): {
                     'destination': '{includedir}/bar-devel.h',
                     'tag': 'devel',
                     'subproject': None,
                 },
-                f'{testdir}/bar-custom.txt': {
+                get_path(f'{testdir}/bar-custom.txt'): {
                     'destination': '{datadir}/bar-custom.txt',
                     'tag': 'custom',
                     'subproject': None,
                 },
-                f'{testdir}/subdir/bar2-devel.h': {
+                get_path(f'{testdir}/subdir/bar2-devel.h'): {
                     'destination': '{includedir}/bar2-devel.h',
                     'tag': 'devel',
                     'subproject': None,
                 },
-                f'{testdir}/subprojects/subproject/aaa.txt': {
+                get_path(f'{testdir}/subprojects/subproject/aaa.txt'): {
                     'destination': '{datadir}/subproject/aaa.txt',
                     'tag': None,
                     'subproject': 'subproject',
                 },
-                f'{testdir}/subprojects/subproject/bbb.txt': {
+                get_path(f'{testdir}/subprojects/subproject/bbb.txt'): {
                     'destination': '{datadir}/subproject/bbb.txt',
                     'tag': 'data',
                     'subproject': 'subproject',
                 },
             },
             'headers': {
-                f'{testdir}/foo1-devel.h': {
+                get_path(f'{testdir}/foo1-devel.h'): {
                     'destination': '{includedir}/foo1-devel.h',
                     'tag': 'devel',
                     'subproject': None,
                 },
-                f'{testdir}/subdir/foo3-devel.h': {
+                get_path(f'{testdir}/subdir/foo3-devel.h'): {
                     'destination': '{includedir}/foo3-devel.h',
                     'tag': 'devel',
                     'subproject': None,
                 },
             },
             'install_subdirs': {
-                f'{testdir}/custom_files': {
+                get_path(f'{testdir}/custom_files'): {
                     'destination': '{datadir}/custom_files',
                     'tag': 'custom',
                     'subproject': None,
                     'exclude_dirs': [],
                     'exclude_files': [],
                 },
-                f'{testdir}/excludes': {
+                get_path(f'{testdir}/excludes'): {
                     'destination': '{datadir}/excludes',
                     'tag': 'custom',
                     'subproject': None,
@@ -4934,11 +5036,10 @@ class AllPlatformTests(BasePlatformTests):
             }
         }
 
-        fix_path = lambda path: os.path.sep.join(path.split('/'))
         expected_fixed = {
             data_type: {
-                fix_path(source): {
-                    key: fix_path(value) if key == 'destination' else value
+                get_path(source): {
+                    key: get_path(value) if key == 'destination' else value
                     for key, value in attributes.items()
                 }
                 for source, attributes in files.items()
@@ -4949,6 +5050,7 @@ class AllPlatformTests(BasePlatformTests):
         for data_type, files in expected_fixed.items():
             for file, details in files.items():
                 with self.subTest(key='{}.{}'.format(data_type, file)):
+                    if data_type == 'data': print(res[data_type])
                     self.assertEqual(res[data_type][file], details)
 
     @skip_if_not_language('rust')
@@ -5221,7 +5323,7 @@ class AllPlatformTests(BasePlatformTests):
         env = get_fake_env()
         cc = detect_c_compiler(env, MachineChoice.HOST)
         has_rsp = cc.linker.id in {
-            'ld.bfd', 'ld.gold', 'ld.lld', 'ld.mold', 'ld.qcld', 'ld.wasm',
+            'ld.bfd', 'ld.eld', 'ld.gold', 'ld.lld', 'ld.mold', 'ld.qcld', 'ld.wasm',
             'link', 'lld-link', 'mwldarm', 'mwldeppc', 'optlink', 'xilink',
         }
         self.assertEqual(cc.linker.get_accepts_rsp(), has_rsp)

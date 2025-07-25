@@ -33,7 +33,7 @@ from .compilers import (
     is_header, is_object, is_source, clink_langs, sort_clink, all_languages,
     is_known_suffix, detect_static_linker
 )
-from .interpreterbase import FeatureNew, FeatureDeprecated
+from .interpreterbase import FeatureNew, FeatureDeprecated, UnknownValue
 
 if T.TYPE_CHECKING:
     from typing_extensions import Literal, TypedDict
@@ -75,6 +75,7 @@ lang_arg_kwargs |= {
 vala_kwargs = {'vala_header', 'vala_gir', 'vala_vapi'}
 rust_kwargs = {'rust_crate_type', 'rust_dependency_map'}
 cs_kwargs = {'resources', 'cs_args'}
+swift_kwargs = {'swift_module_name'}
 
 buildtarget_kwargs = {
     'build_by_default',
@@ -110,7 +111,8 @@ known_build_target_kwargs = (
     pch_kwargs |
     vala_kwargs |
     rust_kwargs |
-    cs_kwargs)
+    cs_kwargs |
+    swift_kwargs)
 
 known_exe_kwargs = known_build_target_kwargs | {'implib', 'export_dynamic', 'pie', 'vs_module_defs', 'android_exe_type'}
 known_shlib_kwargs = known_build_target_kwargs | {'version', 'soversion', 'vs_module_defs', 'darwin_versions', 'rust_abi'}
@@ -275,7 +277,7 @@ class Build:
         self.stdlibs = PerMachine({}, {})
         self.test_setups: T.Dict[str, TestSetup] = {}
         self.test_setup_default_name = None
-        self.find_overrides: T.Dict[str, T.Union['Executable', programs.ExternalProgram, programs.OverrideProgram]] = {}
+        self.find_overrides: T.Dict[str, T.Union['OverrideExecutable', programs.ExternalProgram, programs.OverrideProgram]] = {}
         self.searched_programs: T.Set[str] = set() # The list of all programs that have been searched for.
 
         # If we are doing a cross build we need two caches, if we're doing a
@@ -648,7 +650,7 @@ class Target(HoldableObject, metaclass=abc.ABCMeta):
     def process_kwargs_base(self, kwargs: T.Dict[str, T.Any]) -> None:
         if 'build_by_default' in kwargs:
             self.build_by_default = kwargs['build_by_default']
-            if not isinstance(self.build_by_default, bool):
+            if not isinstance(self.build_by_default, (bool, UnknownValue)):
                 raise InvalidArguments('build_by_default must be a boolean value.')
 
         if not self.build_by_default and kwargs.get('install', False):
@@ -963,7 +965,7 @@ class BuildTarget(Target):
                             self.compilers[lang] = compiler
                         break
                 else:
-                    if is_known_suffix(s):
+                    if is_known_suffix(s) and not is_header(s):
                         path = pathlib.Path(str(s)).as_posix()
                         m = f'No {self.for_machine.get_lower_case_name()} machine compiler for {path!r}'
                         raise MesonException(m)
@@ -1260,6 +1262,10 @@ class BuildTarget(Target):
             raise InvalidArguments(f'Invalid rust_dependency_map "{rust_dependency_map}": must be a dictionary with string values.')
         self.rust_dependency_map = rust_dependency_map
 
+        self.swift_module_name = kwargs.get('swift_module_name')
+        if self.swift_module_name == '':
+            self.swift_module_name = self.name
+
     def _extract_pic_pie(self, kwargs: T.Dict[str, T.Any], arg: str, option: str) -> bool:
         # Check if we have -fPIC, -fpic, -fPIE, or -fpie in cflags
         all_flags = self.extra_args['c'] + self.extra_args['cpp']
@@ -1357,6 +1363,10 @@ class BuildTarget(Target):
         deps = listify(deps)
         for dep in deps:
             if dep in self.added_deps:
+                # Prefer to add dependencies to added_deps which have a name
+                if dep.is_named():
+                    self.added_deps.remove(dep)
+                    self.added_deps.add(dep)
                 continue
 
             if isinstance(dep, dependencies.InternalDependency):
@@ -2181,10 +2191,16 @@ class StaticLibrary(BuildTarget):
                 elif self.rust_crate_type == 'staticlib':
                     self.suffix = 'a'
             else:
-                if 'c' in self.compilers and self.compilers['c'].get_id() == 'tasking':
-                    self.suffix = 'ma' if self.options.get_value('b_lto') and not self.prelink else 'a'
-                else:
-                    self.suffix = 'a'
+                self.suffix = 'a'
+                if 'c' in self.compilers and self.compilers['c'].get_id() == 'tasking' and not self.prelink:
+                    key = OptionKey('b_lto', self.subproject, self.for_machine)
+                    try:
+                        v = self.environment.coredata.get_option_for_target(self, key)
+                    except KeyError:
+                        v = self.environment.coredata.optstore.get_value_for(key)
+                    assert isinstance(v, bool), 'for mypy'
+                    if v:
+                        self.suffix = 'ma'
         self.filename = self.prefix + self.name + '.' + self.suffix
         self.outputs[0] = self.filename
 
@@ -2576,7 +2592,7 @@ class CommandBase:
     subproject: str
 
     def flatten_command(self, cmd: T.Sequence[T.Union[str, File, programs.ExternalProgram, BuildTargetTypes]]) -> \
-            T.List[T.Union[str, File, BuildTarget, 'CustomTarget']]:
+            T.List[T.Union[str, File, BuildTarget, CustomTarget, programs.ExternalProgram]]:
         cmd = listify(cmd)
         final_cmd: T.List[T.Union[str, File, BuildTarget, 'CustomTarget']] = []
         for c in cmd:
@@ -2593,7 +2609,8 @@ class CommandBase:
                     # Can only add a dependency on an external program which we
                     # know the absolute path of
                     self.depend_files.append(File.from_absolute_file(path))
-                final_cmd += c.get_command()
+                # Do NOT flatten -- it is needed for later parsing
+                final_cmd.append(c)
             elif isinstance(c, (BuildTarget, CustomTarget)):
                 self.dependencies.append(c)
                 final_cmd.append(c)
@@ -2663,6 +2680,7 @@ class CustomTarget(Target, CustomTargetBase, CommandBase):
                  install_dir: T.Optional[T.List[T.Union[str, Literal[False]]]] = None,
                  install_mode: T.Optional[FileMode] = None,
                  install_tag: T.Optional[T.List[T.Optional[str]]] = None,
+                 rspable: bool = False,
                  absolute_paths: bool = False,
                  backend: T.Optional['Backend'] = None,
                  description: str = 'Generating {} with a custom command',
@@ -2694,6 +2712,9 @@ class CustomTarget(Target, CustomTargetBase, CommandBase):
 
         # Whether to use absolute paths for all files on the commandline
         self.absolute_paths = absolute_paths
+
+        # Whether to enable using response files for the underlying tool
+        self.rspable = rspable
 
     def get_default_install_dir(self) -> T.Union[T.Tuple[str, str], T.Tuple[None, None]]:
         return None, None
@@ -3110,6 +3131,18 @@ class ConfigurationData(HoldableObject):
 
     def keys(self) -> T.Iterator[str]:
         return self.values.keys()
+
+class OverrideExecutable(Executable):
+    def __init__(self, executable: Executable, version: str):
+        self._executable = executable
+        self._version = version
+
+    def __getattr__(self, name: str) -> T.Any:
+        _executable = object.__getattribute__(self, '_executable')
+        return getattr(_executable, name)
+
+    def get_version(self, interpreter: T.Optional[Interpreter] = None) -> str:
+        return self._version
 
 # A bit poorly named, but this represents plain data files to copy
 # during install.
