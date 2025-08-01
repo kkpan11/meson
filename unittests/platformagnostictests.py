@@ -33,7 +33,7 @@ class PlatformAgnosticTests(BasePlatformTests):
         Tests that find_program() with a relative path does not find the program
         in current workdir.
         '''
-        testdir = os.path.join(self.unit_test_dir, '100 relative find program')
+        testdir = os.path.join(self.unit_test_dir, '101 relative find program')
         self.init(testdir, workdir=testdir)
 
     def test_invalid_option_names(self):
@@ -92,11 +92,28 @@ class PlatformAgnosticTests(BasePlatformTests):
                                interp.process, fname)
 
     def test_python_dependency_without_pkgconfig(self):
-        testdir = os.path.join(self.unit_test_dir, '102 python without pkgconfig')
+        testdir = os.path.join(self.unit_test_dir, '103 python without pkgconfig')
         self.init(testdir, override_envvars={'PKG_CONFIG': 'notfound'})
 
+    def test_vala_target_with_internal_glib(self):
+        testdir = os.path.join(self.unit_test_dir, '131 vala internal glib')
+        for run in [{ 'version': '2.84.4', 'expected': '2.84'}, { 'version': '2.85.2', 'expected': '2.84' }]:
+            self.new_builddir()
+            self.init(testdir, extra_args=[f'-Dglib-version={run["version"]}'])
+            try:
+                with open(os.path.join(self.builddir, 'meson-info', 'intro-targets.json'), 'r', encoding='utf-8') as tgt_intro:
+                    intro = json.load(tgt_intro)
+                    target = list(filter(lambda tgt: tgt['name'] == 'vala-tgt', intro))
+                    self.assertLength(target, 1)
+                    sources = target[0]['target_sources']
+                    vala_sources = filter(lambda src: src.get('language') == 'vala', sources)
+                    for src in vala_sources:
+                        self.assertIn(('--target-glib', run['expected']), zip(src['parameters'], src['parameters'][1:]))
+            except FileNotFoundError:
+                self.skipTest('Current backend does not produce introspection data')
+
     def test_debug_function_outputs_to_meson_log(self):
-        testdir = os.path.join(self.unit_test_dir, '104 debug function')
+        testdir = os.path.join(self.unit_test_dir, '105 debug function')
         log_msg = 'This is an example debug output, should only end up in debug log'
         output = self.init(testdir)
 
@@ -108,7 +125,7 @@ class PlatformAgnosticTests(BasePlatformTests):
         self.assertIn(log_msg, mesonlog)
 
     def test_new_subproject_reconfigure(self):
-        testdir = os.path.join(self.unit_test_dir, '108 new subproject on reconfigure')
+        testdir = os.path.join(self.unit_test_dir, '109 new subproject on reconfigure')
         self.init(testdir)
         self.build()
 
@@ -175,7 +192,7 @@ class PlatformAgnosticTests(BasePlatformTests):
         with self.subTest('Changing the backend'):
             with self.assertRaises(subprocess.CalledProcessError) as cm:
                 self.setconf('-Dbackend=none')
-            self.assertIn("ERROR: Tried to modify read only option 'backend'", cm.exception.stdout)
+            self.assertIn('ERROR: Tried to modify read only option "backend"', cm.exception.stdout)
 
         # Check that the new value was not written in the store.
         with self.subTest('option is stored correctly'):
@@ -271,7 +288,7 @@ class PlatformAgnosticTests(BasePlatformTests):
         thing to do as new features are added, but keeping track of them is
         good.
         '''
-        testdir = os.path.join(self.unit_test_dir, '116 empty project')
+        testdir = os.path.join(self.unit_test_dir, '117 empty project')
 
         self.init(testdir)
         self._run(self.meson_command + ['--internal', 'regenerate', '--profile-self', testdir, self.builddir])
@@ -286,7 +303,7 @@ class PlatformAgnosticTests(BasePlatformTests):
 
     def test_meson_package_cache_dir(self):
         # Copy testdir into temporary directory to not pollute meson source tree.
-        testdir = os.path.join(self.unit_test_dir, '118 meson package cache dir')
+        testdir = os.path.join(self.unit_test_dir, '119 meson package cache dir')
         srcdir = os.path.join(self.builddir, 'srctree')
         shutil.copytree(testdir, srcdir)
         builddir = os.path.join(srcdir, '_build')
@@ -295,7 +312,7 @@ class PlatformAgnosticTests(BasePlatformTests):
 
     def test_cmake_openssl_not_found_bug(self):
         """Issue #12098"""
-        testdir = os.path.join(self.unit_test_dir, '119 openssl cmake bug')
+        testdir = os.path.join(self.unit_test_dir, '120 openssl cmake bug')
         self.meson_native_files.append(os.path.join(testdir, 'nativefile.ini'))
         out = self.init(testdir, allow_fail=True)
         self.assertNotIn('Unhandled python exception', out)
@@ -405,7 +422,7 @@ class PlatformAgnosticTests(BasePlatformTests):
         self.assertIn(f'Did you mean to run meson from the directory: "{testdir}"?', out)
 
     def test_reconfigure_base_options(self):
-        testdir = os.path.join(self.unit_test_dir, '123 reconfigure base options')
+        testdir = os.path.join(self.unit_test_dir, '124 reconfigure base options')
         out = self.init(testdir, extra_args=['-Db_ndebug=true'])
         self.assertIn('\nMessage: b_ndebug: true\n', out)
         self.assertIn('\nMessage: c_std: c89\n', out)
@@ -421,12 +438,12 @@ class PlatformAgnosticTests(BasePlatformTests):
 
         with self.subTest('unknown user option'):
             out = self.init(testdir, extra_args=['-Dnot_an_option=1'], allow_fail=True)
-            self.assertIn('ERROR: Unknown options: "not_an_option"', out)
+            self.assertIn('ERROR: Unknown option: "not_an_option"', out)
 
         with self.subTest('unknown builtin option'):
             self.new_builddir()
             out = self.init(testdir, extra_args=['-Db_not_an_option=1'], allow_fail=True)
-            self.assertIn('ERROR: Unknown options: "b_not_an_option"', out)
+            self.assertIn('ERROR: Unknown option: "b_not_an_option"', out)
 
 
     def test_configure_new_option(self) -> None:
@@ -451,7 +468,7 @@ class PlatformAgnosticTests(BasePlatformTests):
                 f.write(line)
         with self.assertRaises(subprocess.CalledProcessError) as e:
             self.setconf('-Dneg_int_opt=0')
-        self.assertIn('Unknown options: ":neg_int_opt"', e.exception.stdout)
+        self.assertIn('Unknown option: "neg_int_opt"', e.exception.stdout)
 
     def test_reconfigure_option(self) -> None:
         testdir = self.copy_srcdir(os.path.join(self.common_test_dir, '40 options'))
@@ -501,7 +518,7 @@ class PlatformAgnosticTests(BasePlatformTests):
         os.unlink(os.path.join(testdir, 'meson_options.txt'))
         with self.assertRaises(subprocess.CalledProcessError) as e:
             self.setconf('-Dneg_int_opt=0')
-        self.assertIn('Unknown options: ":neg_int_opt"', e.exception.stdout)
+        self.assertIn('Unknown option: "neg_int_opt"', e.exception.stdout)
 
     def test_configure_options_file_added(self) -> None:
         """A new project option file should be detected."""
@@ -531,7 +548,7 @@ class PlatformAgnosticTests(BasePlatformTests):
         self.assertEqual(self.getconf('subproject:new_option'), True)
 
     def test_mtest_rebuild_deps(self):
-        testdir = os.path.join(self.unit_test_dir, '106 underspecified mtest')
+        testdir = os.path.join(self.unit_test_dir, '107 underspecified mtest')
         self.init(testdir)
 
         with self.assertRaises(subprocess.CalledProcessError):

@@ -388,7 +388,7 @@ class NativeFileTests(BasePlatformTests):
     def test_java_classpath(self):
         if self.backend is not Backend.ninja:
             raise SkipTest('Jar is only supported with Ninja')
-        testdir = os.path.join(self.unit_test_dir, '112 classpath')
+        testdir = os.path.join(self.unit_test_dir, '113 classpath')
         self.init(testdir)
         self.build()
         one_build_path = get_classpath(os.path.join(self.builddir, 'one.jar'))
@@ -550,8 +550,8 @@ class NativeFileTests(BasePlatformTests):
         # into augments.
         self.assertEqual(found, 2, 'Did not find all two sections')
 
-    def test_builtin_options_subprojects_overrides_buildfiles(self):
-        # If the buildfile says subproject(... default_library: shared), ensure that's overwritten
+    def test_builtin_options_machinefile_overrides_subproject(self):
+        # The buildfile says subproject(... default_library: static), the machinefile overrides it
         testcase = os.path.join(self.common_test_dir, '223 persubproject options')
         config = self.helper_create_native_file({'sub2:built-in options': {'default_library': 'shared'}})
 
@@ -563,11 +563,18 @@ class NativeFileTests(BasePlatformTests):
                 check = cm.exception.stdout
             self.assertIn(check, 'Parent should override default_library')
 
-    def test_builtin_options_subprojects_dont_inherits_parent_override(self):
-        # If the buildfile says subproject(... default_library: shared), ensure that's overwritten
+    def test_builtin_options_machinefile_global_overrides_subproject(self):
+        # The buildfile says subproject(... default_library: static), ensure that's overridden
         testcase = os.path.join(self.common_test_dir, '223 persubproject options')
         config = self.helper_create_native_file({'built-in options': {'default_library': 'both'}})
-        self.init(testcase, extra_args=['--native-file', config])
+
+        with self.assertRaises((RuntimeError, subprocess.CalledProcessError)) as cm:
+            self.init(testcase, extra_args=['--native-file', config])
+            if isinstance(cm, RuntimeError):
+                check = str(cm.exception)
+            else:
+                check = cm.exception.stdout
+            self.assertIn(check, 'Parent should override default_library')
 
     def test_builtin_options_compiler_properties(self):
         # the properties section can have lang_args, and those need to be
