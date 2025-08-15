@@ -75,26 +75,28 @@ class ModuleState:
                      required: bool = True,
                      version_func: T.Optional[ProgramVersionFunc] = None,
                      wanted: T.Union[str, T.List[str]] = '', silent: bool = False,
-                     for_machine: MachineChoice = MachineChoice.HOST) -> T.Union[ExternalProgram, build.Executable, OverrideProgram]:
+                     for_machine: MachineChoice = MachineChoice.HOST) -> T.Union[ExternalProgram, build.OverrideExecutable, OverrideProgram]:
         if not isinstance(prog, list):
             prog = [prog]
         return self._interpreter.find_program_impl(prog, required=required, version_func=version_func,
                                                    wanted=wanted, silent=silent, for_machine=for_machine)
 
     def find_tool(self, name: str, depname: str, varname: str, required: bool = True,
-                  wanted: T.Optional[str] = None) -> T.Union['build.Executable', ExternalProgram, 'OverrideProgram']:
-        # Look in overrides in case it's built as subproject
-        progobj = self._interpreter.program_from_overrides([name], [])
-        if progobj is not None:
-            return progobj
+                  wanted: T.Optional[str] = None, for_machine: MachineChoice = MachineChoice.HOST) -> T.Union[build.OverrideExecutable, ExternalProgram, 'OverrideProgram']:
+        if for_machine is MachineChoice.HOST:
+            # Look in overrides in case it's built as subproject
+            progobj = self._interpreter.program_from_overrides([name], [])
+            if progobj is not None:
+                return progobj
 
         # Look in machine file
-        prog_list = self.environment.lookup_binary_entry(MachineChoice.HOST, name)
+        prog_list = self.environment.lookup_binary_entry(for_machine, name)
         if prog_list is not None:
             return ExternalProgram.from_entry(name, prog_list)
 
         # Check if pkgconfig has a variable
-        dep = self.dependency(depname, native=True, required=False, wanted=wanted)
+        dep = self.dependency(depname, native=for_machine is MachineChoice.BUILD,
+                              required=False, wanted=wanted)
         if dep.found() and dep.type_name == 'pkgconfig':
             value = dep.get_variable(pkgconfig=varname)
             if value:
@@ -106,7 +108,7 @@ class ModuleState:
                 return progobj
 
         # Normal program lookup
-        return self.find_program(name, required=required, wanted=wanted)
+        return self.find_program(name, required=required, wanted=wanted, for_machine=for_machine)
 
     def dependency(self, depname: str, native: bool = False, required: bool = True,
                    wanted: T.Optional[str] = None) -> 'Dependency':
