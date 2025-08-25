@@ -104,9 +104,9 @@ class FortranCompiler(CLikeCompiler, Compiler):
         return filename
 
     def find_library(self, libname: str, env: 'Environment', extra_dirs: T.List[str],
-                     libtype: LibType = LibType.PREFER_SHARED, lib_prefix_warning: bool = True) -> T.Optional[T.List[str]]:
+                     libtype: LibType = LibType.PREFER_SHARED, lib_prefix_warning: bool = True, ignore_system_dirs: bool = False) -> T.Optional[T.List[str]]:
         code = 'stop; end program'
-        return self._find_library_impl(libname, env, extra_dirs, code, libtype, lib_prefix_warning)
+        return self._find_library_impl(libname, env, extra_dirs, code, libtype, lib_prefix_warning, ignore_system_dirs)
 
     def has_multi_arguments(self, args: T.List[str], env: 'Environment') -> T.Tuple[bool, bool]:
         return self._has_multi_arguments(args, env, 'stop; end program')
@@ -446,6 +446,11 @@ class IntelLLVMFortranCompiler(IntelFortranCompiler):
 
     id = 'intel-llvm'
 
+    def get_preprocess_only_args(self) -> T.List[str]:
+        return ['-preprocess-only']
+
+    def get_dependency_gen_args(self, outtarget: str, outfile: str) -> T.List[str]:
+        return []
 
 class IntelClFortranCompiler(IntelVisualStudioLikeCompiler, FortranCompiler):
 
@@ -643,7 +648,11 @@ class LlvmFlangFortranCompiler(ClangCompiler, FortranCompiler):
         # https://github.com/llvm/llvm-project/commit/8d5386669ed63548daf1bee415596582d6d78d7d;
         # it seems flang 18 doesn't work if something accidentally includes a program unit, see
         # https://github.com/llvm/llvm-project/issues/92496
-        return search_dirs + ['-lFortranRuntime', '-lFortranDecimal']
+        # Only link FortranRuntime and FortranDecimal for flang < 19, see
+        # https://github.com/scipy/scipy/issues/21562#issuecomment-2942938509
+        if version_compare(self.version, '<19'):
+            search_dirs += ['-lFortranRuntime', '-lFortranDecimal']
+        return search_dirs
 
 
 class Open64FortranCompiler(FortranCompiler):

@@ -8,7 +8,7 @@ import subprocess, os.path
 import typing as T
 
 from .. import mlog, options
-from ..mesonlib import MesonException, version_compare
+from ..mesonlib import first, MesonException, version_compare
 from .compilers import Compiler, clike_debug_args
 
 
@@ -139,6 +139,16 @@ class SwiftCompiler(Compiler):
         if std != 'none':
             args += ['-swift-version', std]
 
+        # Pass C compiler -std=... arg to swiftc
+        c_langs = ['objc', 'c']
+        if target.uses_swift_cpp_interop():
+            c_langs = ['objcpp', 'cpp', *c_langs]
+
+        c_lang = first(c_langs, lambda x: x in target.compilers)
+        if c_lang is not None:
+            cc = target.compilers[c_lang]
+            args.extend(arg for c_arg in cc.get_option_std_args(target, env, subproject) for arg in ['-Xcc', c_arg])
+
         return args
 
     def get_working_directory_args(self, path: str) -> T.Optional[T.List[str]]:
@@ -146,6 +156,18 @@ class SwiftCompiler(Compiler):
             return None
 
         return ['-working-directory', path]
+
+    def get_cxx_interoperability_args(self, target: T.Optional[build.BuildTarget] = None) -> T.List[str]:
+        if target is not None and not target.uses_swift_cpp_interop():
+            return []
+
+        if version_compare(self.version, '<5.9'):
+            raise MesonException(f'Compiler {self} does not support C++ interoperability')
+
+        return ['-cxx-interoperability-mode=default']
+
+    def get_library_args(self) -> T.List[str]:
+        return ['-parse-as-library']
 
     def compute_parameters_with_absolute_paths(self, parameter_list: T.List[str],
                                                build_dir: str) -> T.List[str]:

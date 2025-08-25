@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 
 from . import mlog, options
+import argparse
 import pickle, os, uuid
 import sys
 from functools import lru_cache
@@ -18,7 +19,6 @@ from .mesonlib import (
     MesonException, MachineChoice, PerMachine,
     PerMachineDefaultable,
     default_prefix,
-    stringlistify,
     pickle_load
 )
 
@@ -32,13 +32,11 @@ import shlex
 import typing as T
 
 if T.TYPE_CHECKING:
-    import argparse
     from typing_extensions import Protocol
 
     from . import dependencies
     from .compilers.compilers import Compiler, CompileResult, RunResult, CompileCheckMode
     from .dependencies.detect import TV_DepID
-    from .environment import Environment
     from .mesonlib import FileOrString
     from .cmake.traceparser import CMakeCacheEntry
     from .interpreterbase import SubProject
@@ -50,13 +48,11 @@ if T.TYPE_CHECKING:
         """Representation of command line options from Meson setup, configure,
         and dist.
 
-        :param projectoptions: The raw list of command line options given
         :param cmd_line_options: command line options parsed into an OptionKey:
             str mapping
         """
 
-        cmd_line_options: T.Dict[OptionKey, str]
-        projectoptions: T.List[str]
+        cmd_line_options: T.Dict[OptionKey, T.Optional[str]]
         cross_file: T.List[str]
         native_file: T.List[str]
 
@@ -72,7 +68,7 @@ if T.TYPE_CHECKING:
 #
 # Pip requires that RCs are named like this: '0.1.0.rc1'
 # But the corresponding Git tag needs to be '0.1.0rc1'
-version = '1.8.99'
+version = '1.9.99'
 
 # The next stable version when we are in dev. This is used to allow projects to
 # require meson version >=1.2.0 when using 1.1.99. FeatureNew won't warn when
@@ -147,13 +143,13 @@ class DependencyCache:
     def __init__(self, builtins: options.OptionStore, for_machine: MachineChoice):
         self.__cache: T.MutableMapping[TV_DepID, DependencySubCache] = OrderedDict()
         self.__builtins = builtins
-        self.__pkg_conf_key = options.OptionKey('pkg_config_path')
-        self.__cmake_key = options.OptionKey('cmake_prefix_path')
+        self.__pkg_conf_key = options.OptionKey('pkg_config_path', machine=for_machine)
+        self.__cmake_key = options.OptionKey('cmake_prefix_path', machine=for_machine)
 
     def __calculate_subkey(self, type_: DependencyCacheType) -> T.Tuple[str, ...]:
         data: T.Dict[DependencyCacheType, T.List[str]] = {
-            DependencyCacheType.PKG_CONFIG: stringlistify(self.__builtins.get_value_for(self.__pkg_conf_key)),
-            DependencyCacheType.CMAKE: stringlistify(self.__builtins.get_value_for(self.__cmake_key)),
+            DependencyCacheType.PKG_CONFIG: T.cast('T.List[str]', self.__builtins.get_value_for(self.__pkg_conf_key)),
+            DependencyCacheType.CMAKE: T.cast('T.List[str]', self.__builtins.get_value_for(self.__cmake_key)),
             DependencyCacheType.OTHER: [],
         }
         assert type_ in data, 'Someone forgot to update subkey calculations for a new type'
@@ -414,11 +410,7 @@ class CoreData:
         return value
 
     def set_from_configure_command(self, options: SharedCMDOptions) -> bool:
-        unset_opts = getattr(options, 'unset_opts', [])
-        all_D = options.projectoptions[:]
-        for keystr, valstr in options.cmd_line_options.items():
-            all_D.append(f'{keystr}={valstr}')
-        return self.optstore.set_from_configure_command(all_D, unset_opts)
+        return self.optstore.set_from_configure_command(options.cmd_line_options)
 
     def set_option(self, key: OptionKey, value, first_invocation: bool = False) -> bool:
         dirty = False
@@ -573,9 +565,12 @@ class CoreData:
 
         return dirty
 
-    def add_compiler_options(self, c_options: MutableKeyedOptionDictType, lang: str, for_machine: MachineChoice) -> None:
+    def add_compiler_options(self, c_options: MutableKeyedOptionDictType, lang: str, for_machine: MachineChoice,
+                             subproject: str) -> None:
         for k, o in c_options.items():
             assert k.subproject is None and k.machine is for_machine
+            if subproject:
+                k = k.evolve(subproject=subproject)
             if lang == 'objc' and k.name == 'c_std':
                 # For objective C, always fall back to c_std.
                 self.optstore.add_compiler_option('c', k, o)
@@ -584,18 +579,18 @@ class CoreData:
             else:
                 self.optstore.add_compiler_option(lang, k, o)
 
-    def add_lang_args(self, lang: str, comp: T.Type['Compiler'],
-                      for_machine: MachineChoice, env: 'Environment') -> None:
-        """Add global language arguments that are needed before compiler/linker detection."""
-        from .compilers import compilers
-        # These options are all new at this point, because the compiler is
-        # responsible for adding its own options, thus calling
-        # `self.optstore.update()`` is perfectly safe.
-        for gopt_key, gopt_valobj in compilers.get_global_options(lang, comp, for_machine, env).items():
-            self.optstore.add_compiler_option(lang, gopt_key, gopt_valobj)
-
     def process_compiler_options(self, lang: str, comp: Compiler, subproject: str) -> None:
-        self.add_compiler_options(comp.get_options(), lang, comp.for_machine)
+        self.add_compiler_options(comp.get_options(), lang, comp.for_machine, subproject)
+
+        for key in [OptionKey(f'{lang}_args'), OptionKey(f'{lang}_link_args')]:
+            if self.is_cross_build():
+                key = key.evolve(machine=comp.for_machine)
+            # the global option is already there, but any augment is still
+            # sitting in pending_options has to be taken into account
+            assert key in self.optstore
+            if subproject:
+                skey = key.evolve(subproject=subproject)
+                self.optstore.add_compiler_option(lang, skey, self.optstore.get_value_object(key))
 
         for key in comp.base_options:
             if subproject:
@@ -699,24 +694,60 @@ def save(obj: CoreData, build_dir: str) -> str:
     return filename
 
 
+class KeyNoneAction(argparse.Action):
+    """
+    Custom argparse Action that stores values in a dictionary as keys with value None.
+    """
+
+    def __init__(self, option_strings, dest, nargs=None, **kwargs: object) -> None:
+        assert nargs is None or nargs == 1
+        super().__init__(option_strings, dest, nargs=1, **kwargs)
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                 arg: T.List[str], option_string: str = None) -> None:
+        current_dict = getattr(namespace, self.dest)
+        if current_dict is None:
+            current_dict = {}
+            setattr(namespace, self.dest, current_dict)
+
+        key = OptionKey.from_string(arg[0])
+        current_dict[key] = None
+
+
+class KeyValueAction(argparse.Action):
+    """
+    Custom argparse Action that parses KEY=VAL arguments and stores them in a dictionary.
+    """
+
+    def __init__(self, option_strings, dest, nargs=None, **kwargs: object) -> None:
+        assert nargs is None or nargs == 1
+        super().__init__(option_strings, dest, nargs=1, **kwargs)
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                 arg: T.List[str], option_string: str = None) -> None:
+        current_dict = getattr(namespace, self.dest)
+        if current_dict is None:
+            current_dict = {}
+            setattr(namespace, self.dest, current_dict)
+
+        try:
+            keystr, value = arg[0].split('=', 1)
+            key = OptionKey.from_string(keystr)
+            current_dict[key] = value
+        except ValueError:
+            parser.error(f'The argument for option {option_string!r} must be in OPTION=VALUE format.')
+
+
 def register_builtin_arguments(parser: argparse.ArgumentParser) -> None:
     for n, b in options.BUILTIN_OPTIONS.items():
         options.option_to_argparse(b, n, parser, '')
     for n, b in options.BUILTIN_OPTIONS_PER_MACHINE.items():
         options.option_to_argparse(b, n, parser, ' (just for host machine)')
         options.option_to_argparse(b, n.as_build(), parser, ' (just for build machine)')
-    parser.add_argument('-D', action='append', dest='projectoptions', default=[], metavar="option",
+    parser.add_argument('-D', action=KeyValueAction, dest='cmd_line_options', default={}, metavar="option=value",
                         help='Set the value of an option, can be used several times to set multiple options.')
 
 def parse_cmd_line_options(args: SharedCMDOptions) -> None:
-    args.cmd_line_options = {}
-    for o in args.projectoptions:
-        try:
-            (key, value) = o.split('=', 1)
-        except ValueError:
-            raise MesonException(f'Option {o!r} must have a value separated by equals sign.')
-        args.cmd_line_options[key] = value
-
     # Merge builtin options set with --option into the dict.
     for key in chain(
             options.BUILTIN_OPTIONS.keys(),
@@ -730,7 +761,7 @@ def parse_cmd_line_options(args: SharedCMDOptions) -> None:
                 cmdline_name = options.argparse_name_to_arg(name)
                 raise MesonException(
                     f'Got argument {name} as both -D{name} and {cmdline_name}. Pick one.')
-            args.cmd_line_options[key.name] = value
+            args.cmd_line_options[key] = value
             delattr(args, name)
 
 
